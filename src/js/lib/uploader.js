@@ -115,6 +115,116 @@ class WPUploader {
 
 
 const Uploader = {
+	/**
+	 *	Replace a placeholder element inside the tinyMCE document with the given html,
+	 *	keeping the position of the pasted image in the content flow.
+	 *
+	 *	@param {Object} editor      tinyMCE editor instance
+	 *	@param {Element} placeholder progress element inside the editor document
+	 *	@param {String} html        markup of the uploaded attachment
+	 */
+	replaceInEditor: ( editor, placeholder, html ) => {
+		const target = Uploader.imageBlock( editor, placeholder )
+
+		// Fall back to a plain insert at the caret when the placeholder is gone
+		// (e.g. the phrase was emptied by an editor command in the meantime).
+		if ( ! target || ! target.parentNode ) {
+			editor.execCommand( 'mceInsertContent', false, html )
+			return
+		}
+
+		// `mceInsertContent` writes into the current selection, so move the caret
+		// into the (now empty) target block before inserting
+		editor.selection.select( target, true )
+		editor.execCommand( 'mceInsertContent', false, html )
+	},
+	/**
+	 *	Make sure the placeholder is the only child of its own block element and
+	 *	return that block. Pasting into rich text frequently places the image
+	 *	inside an existing paragraph next to text - splitting it here gives the
+	 *	image a paragraph of its own, which keeps `<p>` groups separated.
+	 *
+	 *	@param {Object} editor      tinyMCE editor instance
+	 *	@param {Element} placeholder progress element inside the editor document
+	 *	@return {Element} the (empty) block the image should be inserted into
+	 */
+	imageBlock: ( editor, placeholder ) => {
+		const body = editor.getBody()
+		const parent = placeholder.parentNode
+
+		if ( ! body || ! parent ) {
+			return null
+		}
+
+		// placeholder is not inside a block: wrap it in a paragraph.
+		// insert relative to `parent` - `placeholder` is its child, not the body's.
+		if ( parent === body || ! editor.dom.is( parent, editor.dom.isBlock ) ) {
+			const block = editor.dom.create( 'p' )
+			parent.insertBefore( block, placeholder )
+			block.appendChild( placeholder )
+			return block
+		}
+
+		const hasBefore = !! placeholder.previousSibling
+		const hasAfter  = !! placeholder.nextSibling
+
+		// the paragraph holds only the placeholder: use it as is
+		if ( ! hasBefore && ! hasAfter ) {
+			parent.removeChild( placeholder )
+			return parent
+		}
+
+		// split the paragraph: leading text stays, trailing text moves to a clone,
+		// and the (empty) original keeps the image
+		const trailing = hasAfter ? parent.cloneNode( false ) : null
+
+		if ( hasAfter ) {
+			while ( placeholder.nextSibling ) {
+				trailing.appendChild( placeholder.nextSibling )
+			}
+			if ( parent.parentNode ) {
+				parent.parentNode.insertBefore( trailing, parent.nextSibling )
+			}
+		}
+
+		// drop everything in front of the placeholder so the block is empty again
+		while ( placeholder.previousSibling ) {
+			parent.removeChild( placeholder.previousSibling )
+		}
+		if ( placeholder.parentNode ) {
+			placeholder.parentNode.removeChild( placeholder )
+		}
+
+		// nothing was in front of the image: the leading paragraph is empty now
+		if ( ! parent.textContent.trim() && ! parent.querySelector( 'img,video,audio,iframe' ) ) {
+			if ( parent.parentNode ) {
+				parent.parentNode.removeChild( parent )
+			}
+			const block = editor.dom.create( 'p' )
+			if ( trailing && trailing.parentNode ) {
+				trailing.parentNode.insertBefore( block, trailing )
+			} else {
+				body.appendChild( block )
+			}
+			return block
+		}
+
+		// leading text remains: give the image a fresh paragraph right after it
+		const block = editor.dom.create( 'p' )
+		const anchor = parent.parentNode
+		if ( ! anchor ) {
+			body.appendChild( block )
+		} else if ( trailing && trailing.parentNode === anchor ) {
+			anchor.insertBefore( block, trailing )
+		} else if ( parent.parentNode === anchor && parent.nextSibling ) {
+			anchor.insertBefore( block, parent.nextSibling )
+		} else if ( parent.parentNode === anchor ) {
+			anchor.appendChild( block )
+		} else {
+			body.appendChild( block )
+		}
+		return block
+	},
 	inlineUpload: async el => {
 
 		const file = await Converter.elementToFile( el )
@@ -153,7 +263,7 @@ const Uploader = {
 				newElement.innerHTML = wp.media.string.image( {
 					link,
 					align: getUserSetting( 'align', 'none' ),
-					size:  getUserSetting( 'imgsize', 'medium' ),
+					size:  Uploader.getImageSize( attachment ),
 				}, attachment )
 
 			} else if ( 'video' === attachment.type ) {
@@ -177,19 +287,50 @@ const Uploader = {
 						: 'file'
 				}, attachment )
 			}
-			/*
-			if ( tinymce.activeEditor ) {
-
-				tinymce.activeEditor.execCommand( 'mceInsertContent', false, newElement.innerHTML );
-				progress.remove()
+			// The progress element lives inside the editor iframe (a separate document),
+			// so replacing it in the parent document is a no-op. Use the editor API instead
+			// to swap the placeholder in place - otherwise the image ends up at the
+			// current cursor position (typically after all pasted text).
+			if ( tinymce.activeEditor && el.ownerDocument === tinymce.activeEditor.getDoc() ) {
+				Uploader.replaceInEditor( tinymce.activeEditor, progress, newElement.innerHTML )
 			} else {
 				progress.replaceWith( newElement.childNodes[0] )
 			}
-			/*/
-			progress.replaceWith( newElement.childNodes[0] )
-			//*/
 		}
 		uploader.upload()
+	},
+	/**
+	 *	Resolve the image size for pasted images.
+	 *
+	 *	Prefers the size the user picked in the media modal. Falls back to `large`
+	 *	instead of WordPress' `medium` default, as pasted content is usually the
+	 *	main body image and looks too small at medium size.
+	 *
+	 *	@param {Object} attachment attachment attributes
+	 *	@return {String} size name
+	 */
+	getImageSize: attachment => {
+		const sizes = attachment?.sizes ?? {}
+		const preferred = 'large'
+
+		// explicit user choice in the media modal wins
+		const userSize = getUserSetting( 'imgsize' )
+		if ( userSize && sizes[ userSize ] ) {
+			return userSize
+		}
+
+		// requested default, if the attachment actually has that size
+		if ( sizes[ preferred ] ) {
+			return preferred
+		}
+
+		// largest available size as a last resort
+		const available = Object.keys( sizes )
+		if ( available.length ) {
+			return available.includes( 'full' ) ? 'full' : available[ available.length - 1 ]
+		}
+
+		return 'full'
 	},
 	/**
 	 *	Generate a filename
