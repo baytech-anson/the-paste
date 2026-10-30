@@ -14,3 +14,23 @@ test export-ignore
 phpcs*.xml export-ignore
 phpunit.* export-ignore
 .* export-ignore
+
+# normalize line endings - keep LF in the repository and in the working tree
+* text=auto eol=lf
+
+# binary files must never be converted
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.webp binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.eot binary
+*.zip binary
+*.gz binary
+
+# sourcemaps are text, normalize them like the sources
+*.map text eol=lf
